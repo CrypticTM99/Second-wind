@@ -1,46 +1,57 @@
 -- name: Second Wind
--- description: A cooperative recovery system where players can earn a second chance through a three-hit timing challenge.\n\nCreated by CrypticTM
--- \n-- WORK IN PROGRESS: Some things may not work right yet.
+-- description: A Deltarune-inspired recovery minigame that gives Mario one last chance after death.
+--
+-- Created by CrypticTM
+-- 
+-- WORK IN PROGRESS: Some things may not work right yet.
 
-local SECOND_WIND_ENABLED = true
-local SECOND_WIND_ATTEMPTS = 3
-local SECOND_WIND_WINDOW = 12
-local SECOND_WIND_SPEED = 3
-local SECOND_WIND_COOLDOWN = 180
-local SECOND_WIND_REQUIRED_HITS = 3
-local SECOND_WIND_RETRY_DELAY = 12
-local SECOND_WIND_POPUP_FRAMES = 75
-local SECOND_WIND_SUCCESS_FRAMES = 70
-local SECOND_WIND_FAIL_FRAMES = 70
+local REQUIRED_HITS = 3
+local MAX_ATTEMPTS = 5
 
-local SECOND_WIND_STATE_IDLE = 0
-local SECOND_WIND_STATE_ACTIVE = 1
-local SECOND_WIND_STATE_SUCCESS = 2
-local SECOND_WIND_STATE_FAILED = 3
+local BAR_SPEED = 0.025
+local PERFECT_WINDOW = 0.075
 
-local secondWindState = SECOND_WIND_STATE_IDLE
+local SUCCESS_DISPLAY_FRAMES = 75
+local FAILURE_DISPLAY_FRAMES = 45
+local RECOVERY_COOLDOWN = 180
+
+local DIFFICULTY_NORMAL = 1
+local DIFFICULTY_HARD = 2
+local DIFFICULTY_EXPERT = 3
+
+local STATE_IDLE = 0
+local STATE_ACTIVE = 1
+local STATE_SUCCESS = 2
+local STATE_FAILED = 3
+
+local secondWindState = STATE_IDLE
+local secondWindEnabled = true
+local secondWindDifficulty = DIFFICULTY_NORMAL
+
 local secondWindHits = 0
-local secondWindAttempts = SECOND_WIND_ATTEMPTS
-local secondWindPosition = 0
-local secondWindDirection = 1
-local secondWindTimer = 0
-local secondWindResultTimer = 0
-local secondWindCooldown = 0
-local secondWindLastHit = false
-local secondWindWasActive = false
-local secondWindSavedPosition = nil
-local secondWindSavedAngle = 0
-local secondWindSavedArea = 1
-local secondWindSavedLevel = LEVEL_CASTLE_GROUNDS
-local secondWindHudAlpha = 0
-local secondWindPulse = 0
-local secondWindTestRequested = false
+local secondWindAttempts = MAX_ATTEMPTS
 
-local secondWindMenuEnabled = true
-local secondWindMenuDifficulty = 1
+local timingPosition = 0
+local timingDirection = 1
+
+local resultTimer = 0
+local cooldownTimer = 0
+
+local hudAlpha = 0
+local hitFlash = 0
+local missFlash = 0
+
+local savedPosition = nil
+local savedFaceAngle = 0
+
+local recoveryMario = nil
+
+local deathWasIntercepted = false
+local allowNormalDeath = false
+local cameraRecoveryTimer = 0
 
 gGlobalSyncTable.secondWindEnabled = true
-gGlobalSyncTable.secondWindDifficulty = 1
+gGlobalSyncTable.secondWindDifficulty = DIFFICULTY_NORMAL
 
 for i = 0, MAX_PLAYERS - 1 do
     gPlayerSyncTable[i].secondWindAvailable = true
@@ -59,71 +70,97 @@ local function clamp(value, minimum, maximum)
     return value
 end
 
-local function copy_position(m)
-    return {
+local function reset_saved_position()
+    savedPosition = nil
+    savedFaceAngle = 0
+end
+
+local function save_position(m)
+    if m.pos == nil then
+        return
+    end
+
+    savedPosition = {
         x = m.pos.x,
         y = m.pos.y,
         z = m.pos.z
     }
+
+    savedFaceAngle = m.faceAngle.y
 end
 
 local function restore_position(m)
-    if secondWindSavedPosition == nil then
+    if savedPosition == nil then
         return false
     end
 
-    m.pos.x = secondWindSavedPosition.x
-    m.pos.y = secondWindSavedPosition.y
-    m.pos.z = secondWindSavedPosition.z
+    m.pos.x = savedPosition.x
+    m.pos.y = savedPosition.y
+    m.pos.z = savedPosition.z
+
+    m.faceAngle.y = savedFaceAngle
+
     m.vel.x = 0
     m.vel.y = 0
     m.vel.z = 0
     m.forwardVel = 0
-    m.faceAngle.y = secondWindSavedAngle
 
     return true
 end
 
-local function get_difficulty_window()
-    if secondWindMenuDifficulty == 1 then
-        return SECOND_WIND_WINDOW
-    end
-
-    if secondWindMenuDifficulty == 2 then
-        return math.max(7, SECOND_WIND_WINDOW - 3)
-    end
-
-    return math.max(4, SECOND_WIND_WINDOW - 6)
+local function reset_player_sync()
+    gPlayerSyncTable[0].secondWindAvailable = true
+    gPlayerSyncTable[0].secondWindRecovered = false
 end
 
-local function get_difficulty_speed()
-    if secondWindMenuDifficulty == 1 then
-        return SECOND_WIND_SPEED
-    end
+local function reset_minigame()
+    secondWindState = STATE_IDLE
 
-    if secondWindMenuDifficulty == 2 then
-        return SECOND_WIND_SPEED + 1
-    end
-
-    return SECOND_WIND_SPEED + 2
-end
-
-local function reset_second_wind()
-    secondWindState = SECOND_WIND_STATE_IDLE
     secondWindHits = 0
-    secondWindAttempts = SECOND_WIND_ATTEMPTS
-    secondWindPosition = 0
-    secondWindDirection = 1
-    secondWindTimer = 0
-    secondWindResultTimer = 0
-    secondWindLastHit = false
-    secondWindWasActive = false
-    secondWindHudAlpha = 0
-    secondWindPulse = 0
+    secondWindAttempts = MAX_ATTEMPTS
+
+    timingPosition = 0
+    timingDirection = 1
+
+    resultTimer = 0
+
+    hudAlpha = 0
+    hitFlash = 0
+    missFlash = 0
+
+    recoveryMario = nil
+
+    deathWasIntercepted = false
+    allowNormalDeath = false
+    cameraRecoveryTimer = 0
 end
 
-local function can_start_second_wind()
-    if not secondWindMenuEnabled then
+local function get_bar_speed()
+    if secondWindDifficulty == DIFFICULTY_HARD then
+        return BAR_SPEED * 1.22
+    end
+
+    if secondWindDifficulty == DIFFICULTY_EXPERT then
+        return BAR_SPEED * 1.48
+    end
+
+    return BAR_SPEED
+end
+
+local function get_perfect_window()
+    if secondWindDifficulty == DIFFICULTY_HARD then
+        return PERFECT_WINDOW * 0.82
+    end
+
+    if secondWindDifficulty == DIFFICULTY_EXPERT then
+        return PERFECT_WINDOW * 0.66
+    end
+
+    return PERFECT_WINDOW
+end
+
+local function is_second_wind_available()
+    if not secondWindEnabled then
         return false
     end
 
@@ -131,11 +168,11 @@ local function can_start_second_wind()
         return false
     end
 
-    if secondWindState ~= SECOND_WIND_STATE_IDLE then
+    if cooldownTimer > 0 then
         return false
     end
 
-    if secondWindCooldown > 0 then
+    if secondWindState ~= STATE_IDLE then
         return false
     end
 
@@ -143,196 +180,252 @@ local function can_start_second_wind()
         return false
     end
 
-    return true
-end
-
-local function start_second_wind(m)
-    if not can_start_second_wind() then
+    if savedPosition == nil then
         return false
     end
 
-    secondWindSavedPosition = copy_position(m)
-    secondWindSavedAngle = m.faceAngle.y
-    secondWindSavedArea = gNetworkPlayers[0].currAreaIndex
-    secondWindSavedLevel = gNetworkPlayers[0].currLevelNum
+    return true
+end
 
-    secondWindState = SECOND_WIND_STATE_ACTIVE
+local function start_minigame(m)
+    if not is_second_wind_available() then
+        return false
+    end
+
+    recoveryMario = m
+
+    secondWindState = STATE_ACTIVE
+
     secondWindHits = 0
-    secondWindAttempts = SECOND_WIND_ATTEMPTS
-    secondWindPosition = 0
-    secondWindDirection = 1
-    secondWindTimer = 0
-    secondWindResultTimer = 0
-    secondWindLastHit = false
-    secondWindWasActive = true
-    secondWindHudAlpha = 0
-    secondWindPulse = 0
+    secondWindAttempts = MAX_ATTEMPTS
+
+    timingPosition = 0
+    timingDirection = 1
+
+    resultTimer = 0
+
+    hudAlpha = 0
+    hitFlash = 0
+    missFlash = 0
+
+    deathWasIntercepted = true
+    allowNormalDeath = false
+    cameraRecoveryTimer = 0
+
+    m.health = 0x880
+    m.hurtCounter = 0
+    m.invincTimer = 0
+
+    m.vel.x = 0
+    m.vel.y = 0
+    m.vel.z = 0
+    m.forwardVel = 0
+
+    set_mario_action(m, ACT_IDLE, 0)
 
     return true
 end
 
-local function finish_second_wind(m)
-    if secondWindState ~= SECOND_WIND_STATE_SUCCESS then
+local function timing_is_good()
+    return math.abs(
+        timingPosition - 0.5
+    ) <= get_perfect_window()
+end
+
+local function successful_hit()
+    secondWindHits = secondWindHits + 1
+    hitFlash = 10
+
+    timingPosition = 0
+    timingDirection = 1
+
+    if secondWindHits >= REQUIRED_HITS then
+        secondWindState = STATE_SUCCESS
+        resultTimer = SUCCESS_DISPLAY_FRAMES
+    end
+end
+
+local function failed_hit()
+    secondWindAttempts =
+        secondWindAttempts - 1
+
+    missFlash = 10
+
+    timingPosition = 0
+    timingDirection = 1
+
+    if secondWindAttempts <= 0 then
+        secondWindState = STATE_FAILED
+        resultTimer = FAILURE_DISPLAY_FRAMES
+    end
+end
+
+local function update_minigame(m)
+    if secondWindState ~= STATE_ACTIVE then
         return
     end
 
-    if secondWindResultTimer > 0 then
+    timingPosition =
+        timingPosition +
+        get_bar_speed() *
+        timingDirection
+
+    if timingPosition >= 1 then
+        timingPosition = 1
+        timingDirection = -1
+    elseif timingPosition <= 0 then
+        timingPosition = 0
+        timingDirection = 1
+    end
+
+    if (m.input & INPUT_A_PRESSED) ~= 0 then
+        if timing_is_good() then
+            successful_hit()
+        else
+            failed_hit()
+        end
+    end
+
+    m.health = 0x880
+    m.hurtCounter = 0
+
+    m.vel.x = 0
+    m.vel.y = 0
+    m.vel.z = 0
+    m.forwardVel = 0
+
+    if m.action ~= ACT_IDLE then
+        set_mario_action(m, ACT_IDLE, 0)
+    end
+end
+
+local function release_camera(m)
+    if m == nil then
+        return
+    end
+
+    cameraRecoveryTimer = 15
+
+    set_mario_action(m, ACT_IDLE, 0)
+
+    m.vel.x = 0
+    m.vel.y = 0
+    m.vel.z = 0
+    m.forwardVel = 0
+
+    m.health = 0x880
+    m.hurtCounter = 0
+end
+
+local function finish_success(m)
+    if m == nil then
+        reset_minigame()
         return
     end
 
     if not restore_position(m) then
+        reset_minigame()
         return
     end
 
     m.health = 0x880
     m.hurtCounter = 0
     m.invincTimer = 90
-    m.actionTimer = 0
-    m.prevAction = ACT_IDLE
-    m.action = ACT_IDLE
+
     m.vel.x = 0
     m.vel.y = 0
     m.vel.z = 0
     m.forwardVel = 0
 
+    m.actionTimer = 0
+
+    set_mario_action(
+        m,
+        ACT_IDLE,
+        0
+    )
+
     gPlayerSyncTable[0].secondWindAvailable = false
     gPlayerSyncTable[0].secondWindRecovered = true
 
-    secondWindCooldown = SECOND_WIND_COOLDOWN
-    secondWindResultTimer = SECOND_WIND_SUCCESS_FRAMES
+    cooldownTimer = RECOVERY_COOLDOWN
+
+    release_camera(m)
+
+    secondWindState = STATE_IDLE
+    resultTimer = 0
+    hudAlpha = 0
+
+    recoveryMario = nil
+    deathWasIntercepted = false
+    allowNormalDeath = false
+
+    djui_chat_message_create(
+        "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ YOU'RE BACK!"
+    )
 end
 
-local function fail_second_wind()
-    secondWindState = SECOND_WIND_STATE_FAILED
-    secondWindResultTimer = SECOND_WIND_FAIL_FRAMES
-    secondWindHudAlpha = 255
-end
-
-local function register_hit()
-    secondWindHits = secondWindHits + 1
-    secondWindLastHit = true
-    secondWindTimer = 0
-    secondWindPulse = 18
-
-    if secondWindHits >= SECOND_WIND_REQUIRED_HITS then
-        secondWindState = SECOND_WIND_STATE_SUCCESS
-        secondWindResultTimer = SECOND_WIND_SUCCESS_FRAMES
+local function finish_failure(m)
+    if m == nil then
+        reset_minigame()
         return
     end
 
-    secondWindPosition = 0
-    secondWindDirection = 1
+    release_camera(m)
+
+    recoveryMario = nil
+
+    secondWindState = STATE_IDLE
+    resultTimer = 0
+    hudAlpha = 0
+
+    deathWasIntercepted = false
+    allowNormalDeath = true
+
+    gPlayerSyncTable[0].secondWindAvailable = false
+    gPlayerSyncTable[0].secondWindRecovered = false
+
+    reset_saved_position()
+
+    m.health = 0
+    m.hurtCounter = 0
+
+    m.vel.x = 0
+    m.vel.y = 0
+    m.vel.z = 0
+    m.forwardVel = 0
+
+    set_mario_action(
+        m,
+        ACT_DEATH_EXIT_LAND,
+        0
+    )
 end
 
-local function register_miss()
-    secondWindAttempts = secondWindAttempts - 1
-    secondWindLastHit = false
-    secondWindTimer = 0
-    secondWindPulse = 10
-
-    if secondWindAttempts <= 0 then
-        fail_second_wind()
+local function update_result_state()
+    if secondWindState ~= STATE_SUCCESS and
+        secondWindState ~= STATE_FAILED then
         return
     end
 
-    secondWindPosition = 0
-    secondWindDirection = 1
-end
+    resultTimer =
+        math.max(
+            0,
+            resultTimer - 1
+        )
 
-local function get_input_pressed(m)
-    return (m.controller.buttonPressed & A_BUTTON) ~= 0
-end
-
-local function is_inside_target()
-    local targetCenter = 0.5
-    local window = get_difficulty_window() / 100
-
-    return math.abs(secondWindPosition - targetCenter) <= window
-end
-
-local function update_second_wind_game(m)
-    if secondWindState ~= SECOND_WIND_STATE_ACTIVE then
+    if resultTimer > 0 then
         return
     end
 
-    secondWindTimer = secondWindTimer + 1
-
-    local speed = get_difficulty_speed() / 100
-
-    secondWindPosition =
-        secondWindPosition +
-        (speed * secondWindDirection)
-
-    if secondWindPosition >= 1 then
-        secondWindPosition = 1
-        secondWindDirection = -1
-    elseif secondWindPosition <= 0 then
-        secondWindPosition = 0
-        secondWindDirection = 1
-    end
-
-    if get_input_pressed(m) then
-        if is_inside_target() then
-            register_hit()
-        else
-            register_miss()
-        end
-    end
-end
-
-local function update_second_wind_result(m)
-    if secondWindState == SECOND_WIND_STATE_SUCCESS then
-        if secondWindResultTimer > 0 then
-            secondWindResultTimer = secondWindResultTimer - 1
-        end
-
-        if secondWindResultTimer <= 0 then
-            finish_second_wind(m)
-        end
-
+    if secondWindState == STATE_SUCCESS then
+        finish_success(recoveryMario)
         return
     end
 
-    if secondWindState == SECOND_WIND_STATE_FAILED then
-        if secondWindResultTimer > 0 then
-            secondWindResultTimer = secondWindResultTimer - 1
-        end
-
-        if secondWindResultTimer <= 0 then
-            reset_second_wind()
-        end
+    if secondWindState == STATE_FAILED then
+        finish_failure(recoveryMario)
     end
-end
-
-local function update_second_wind_cooldown()
-    if secondWindCooldown > 0 then
-        secondWindCooldown = secondWindCooldown - 1
-    end
-end
-
-local function update_saved_position(m)
-    if secondWindState ~= SECOND_WIND_STATE_IDLE then
-        return
-    end
-
-    if secondWindCooldown > 0 then
-        return
-    end
-
-    if m.action == ACT_DEATH_EXIT or
-        m.action == ACT_DEATH_ON_BACK or
-        m.action == ACT_DEATH_ON_STOMACH then
-        return
-    end
-
-    if m.health <= 0x100 then
-        return
-    end
-
-    secondWindSavedPosition = copy_position(m)
-    secondWindSavedAngle = m.faceAngle.y
-    secondWindSavedArea = gNetworkPlayers[0].currAreaIndex
-    secondWindSavedLevel = gNetworkPlayers[0].currLevelNum
 end
 
 local function mario_update(m)
@@ -340,21 +433,125 @@ local function mario_update(m)
         return
     end
 
-    update_second_wind_cooldown()
-    update_saved_position(m)
+    if cooldownTimer > 0 then
+        cooldownTimer =
+            cooldownTimer - 1
+    end
 
-    if secondWindState == SECOND_WIND_STATE_ACTIVE then
-        update_second_wind_game(m)
+    if cameraRecoveryTimer > 0 then
+        cameraRecoveryTimer =
+            cameraRecoveryTimer - 1
 
-        m.vel.x = 0
-        m.vel.y = 0
-        m.vel.z = 0
-        m.forwardVel = 0
+        if secondWindState == STATE_IDLE then
+            m.health = 0x880
+            m.hurtCounter = 0
+            m.vel.x = 0
+            m.vel.y = 0
+            m.vel.z = 0
+            m.forwardVel = 0
+
+            if m.action ~= ACT_IDLE then
+                set_mario_action(
+                    m,
+                    ACT_IDLE,
+                    0
+                )
+            end
+        end
+    end
+
+    if hitFlash > 0 then
+        hitFlash = hitFlash - 1
+    end
+
+    if missFlash > 0 then
+        missFlash = missFlash - 1
+    end
+
+    if secondWindState == STATE_IDLE then
+        if m.health > 0x400 then
+            save_position(m)
+        end
 
         return
     end
 
-    update_second_wind_result(m)
+    if secondWindState == STATE_ACTIVE then
+        update_minigame(m)
+        return
+    end
+
+    update_result_state()
+end
+
+local function before_mario_update(m)
+    if m.playerIndex ~= 0 then
+        return
+    end
+
+    if secondWindState ~= STATE_ACTIVE then
+        return
+    end
+
+    m.health = 0x880
+    m.hurtCounter = 0
+
+    m.vel.x = 0
+    m.vel.y = 0
+    m.vel.z = 0
+    m.forwardVel = 0
+
+    if m.action ~= ACT_IDLE then
+        set_mario_action(
+            m,
+            ACT_IDLE,
+            0
+        )
+    end
+end
+
+local function before_set_mario_action(
+    m,
+    incomingAction,
+    actionArg
+)
+    if m.playerIndex ~= 0 then
+        return
+    end
+
+    if secondWindState ~= STATE_ACTIVE then
+        return
+    end
+
+    if incomingAction == ACT_DEATH_EXIT_LAND or
+        incomingAction == ACT_DEATH_ON_STOMACH or
+        incomingAction == ACT_DEATH_ON_BACK or
+        incomingAction == ACT_DEATH_QUICKSAND or
+        incomingAction == ACT_DEATH_EXIT then
+        return 1
+    end
+
+    return 1
+end
+
+local function on_camera_mode(
+    camera,
+    mode,
+    frames
+)
+    if secondWindState ~= STATE_ACTIVE then
+        return
+    end
+
+    return false
+end
+
+local function on_change_camera_angle(mode)
+    if secondWindState ~= STATE_ACTIVE then
+        return
+    end
+
+    return false
 end
 
 local function on_death(m)
@@ -362,609 +559,927 @@ local function on_death(m)
         return
     end
 
-    if secondWindState ~= SECOND_WIND_STATE_IDLE then
+    if allowNormalDeath then
+        allowNormalDeath = false
         return
     end
 
-    if not can_start_second_wind() then
+    if secondWindState ~= STATE_IDLE then
+        return false
+    end
+
+    if not is_second_wind_available() then
         return
     end
 
-    if start_second_wind(m) then
+    if start_minigame(m) then
         return false
     end
 end
 
-local function on_level_init()
-    reset_second_wind()
+local function on_level_init(
+    levelType,
+    levelNum,
+    areaIdx,
+    nodeId,
+    arg
+)
+    reset_minigame()
+    reset_saved_position()
 
-    secondWindCooldown = 0
-    secondWindSavedPosition = nil
+    cooldownTimer = 0
 
-    gPlayerSyncTable[0].secondWindAvailable = true
-    gPlayerSyncTable[0].secondWindRecovered = false
+    reset_player_sync()
 end
 
-local function draw_text_centered(text, y, scale, r, g, b, a)
-    local width = djui_hud_measure_text(text) * scale
-    local screenWidth = djui_hud_get_screen_width()
-    local x = (screenWidth - width) / 2
+local function update_second_wind()
+    if secondWindState == STATE_IDLE then
+        return
+    end
 
-    djui_hud_set_color(r, g, b, a)
-    djui_hud_print_text(text, x, y, scale)
+    if hudAlpha < 255 then
+        hudAlpha =
+            math.min(
+                255,
+                hudAlpha + 24
+            )
+    end
 end
 
-local function draw_rect(x, y, width, height, r, g, b, a)
-    djui_hud_set_color(r, g, b, a)
-    djui_hud_render_rect(x, y, width, height)
+local function hud_width()
+    return djui_hud_get_screen_width()
 end
 
-local function draw_border(x, y, width, height, r, g, b, a)
-    draw_rect(x, y, width, 2, r, g, b, a)
-    draw_rect(x, y + height - 2, width, 2, r, g, b, a)
-    draw_rect(x, y, 2, height, r, g, b, a)
-    draw_rect(x + width - 2, y, 2, height, r, g, b, a)
+local function hud_height()
+    return djui_hud_get_screen_height()
 end
 
-local function draw_heart(x, y, scale, alpha)
-    local size = 5 * scale
+local function text_width(text, scale)
+    return
+        djui_hud_measure_text(text) *
+        scale
+end
 
-    draw_rect(
-        x - size * 1.2,
-        y - size * 0.8,
-        size,
-        size,
-        255,
-        255,
-        255,
-        alpha
+local function centered_x(text, scale)
+    return
+        (
+            hud_width() -
+            text_width(text, scale)
+        ) / 2
+end
+
+local function draw_text(
+    text,
+    x,
+    y,
+    scale,
+    r,
+    g,
+    b,
+    a
+)
+    djui_hud_set_color(
+        r,
+        g,
+        b,
+        a
     )
 
-    draw_rect(
-        x + size * 0.2,
-        y - size * 0.8,
-        size,
-        size,
-        255,
-        255,
-        255,
-        alpha
-    )
-
-    draw_rect(
-        x - size * 0.8,
+    djui_hud_print_text(
+        text,
+        x,
         y,
-        size * 1.6,
-        size,
-        255,
-        255,
-        255,
-        alpha
-    )
-
-    draw_rect(
-        x - size * 0.4,
-        y + size,
-        size * 0.8,
-        size,
-        255,
-        255,
-        255,
-        alpha
+        scale
     )
 end
 
-local function draw_timing_line(x, y, width, alpha)
+local function draw_centered_text(
+    text,
+    y,
+    scale,
+    r,
+    g,
+    b,
+    a
+)
+    draw_text(
+        text,
+        centered_x(text, scale),
+        y,
+        scale,
+        r,
+        g,
+        b,
+        a
+    )
+end
+
+local function draw_rect(
+    x,
+    y,
+    width,
+    height,
+    r,
+    g,
+    b,
+    a
+)
+    djui_hud_set_color(
+        r,
+        g,
+        b,
+        a
+    )
+
+    djui_hud_render_rect(
+        x,
+        y,
+        width,
+        height
+    )
+end
+
+local function draw_outline(
+    x,
+    y,
+    width,
+    height,
+    r,
+    g,
+    b,
+    a
+)
     draw_rect(
         x,
         y,
         width,
         2,
-        255,
-        255,
-        255,
+        r,
+        g,
+        b,
+        a
+    )
+
+    draw_rect(
+        x,
+        y + height - 2,
+        width,
+        2,
+        r,
+        g,
+        b,
+        a
+    )
+
+    draw_rect(
+        x,
+        y,
+        2,
+        height,
+        r,
+        g,
+        b,
+        a
+    )
+
+    draw_rect(
+        x + width - 2,
+        y,
+        2,
+        height,
+        r,
+        g,
+        b,
+        a
+    )
+end
+
+local function draw_panel(
+    x,
+    y,
+    width,
+    height,
+    alpha
+)
+    draw_rect(
+        x + 6,
+        y + 7,
+        width,
+        height,
+        0,
+        0,
+        0,
+        alpha * 0.55
+    )
+
+    draw_rect(
+        x,
+        y,
+        width,
+        height,
+        8,
+        8,
+        10,
+        alpha * 0.98
+    )
+
+    draw_outline(
+        x,
+        y,
+        width,
+        height,
+        235,
+        235,
+        235,
         alpha
     )
 
-    local targetWidth = width * 0.12
-    local targetX = x + (width - targetWidth) / 2
+    draw_rect(
+        x + 3,
+        y + 3,
+        width - 6,
+        2,
+        255,
+        255,
+        255,
+        alpha * 0.14
+    )
+end
+
+local function draw_heart(
+    x,
+    y,
+    scale,
+    r,
+    g,
+    b,
+    a
+)
+    local size = 5 * scale
+
+    draw_rect(
+        x - size * 1.5,
+        y - size,
+        size,
+        size,
+        r,
+        g,
+        b,
+        a
+    )
+
+    draw_rect(
+        x + size * 0.5,
+        y - size,
+        size,
+        size,
+        r,
+        g,
+        b,
+        a
+    )
+
+    draw_rect(
+        x - size,
+        y,
+        size * 2,
+        size,
+        r,
+        g,
+        b,
+        a
+    )
+
+    draw_rect(
+        x - size * 0.5,
+        y + size,
+        size,
+        size,
+        r,
+        g,
+        b,
+        a
+    )
+end
+
+local function draw_heart_outline(
+    x,
+    y,
+    scale,
+    alpha
+)
+    local size = 5 * scale
+
+    draw_outline(
+        x - size * 1.5,
+        y - size,
+        size,
+        size,
+        120,
+        120,
+        120,
+        alpha
+    )
+
+    draw_outline(
+        x + size * 0.5,
+        y - size,
+        size,
+        size,
+        120,
+        120,
+        120,
+        alpha
+    )
+
+    draw_outline(
+        x - size,
+        y,
+        size * 2,
+        size,
+        120,
+        120,
+        120,
+        alpha
+    )
+end
+
+local function draw_target_zone(
+    x,
+    y,
+    width,
+    height,
+    alpha
+)
+    local targetWidth =
+        width *
+        get_perfect_window() *
+        2
+
+    local targetX =
+        x +
+        (
+            width -
+            targetWidth
+        ) / 2
 
     draw_rect(
         targetX,
         y - 5,
         targetWidth,
-        12,
+        height + 10,
         255,
         255,
         255,
-        alpha
+        alpha * 0.10
     )
 
-    draw_rect(
-        targetX + 3,
-        y - 2,
-        targetWidth - 6,
-        6,
-        0,
-        0,
-        0,
-        alpha
+    draw_outline(
+        targetX,
+        y - 5,
+        targetWidth,
+        height + 10,
+        255,
+        255,
+        255,
+        alpha * 0.72
     )
 end
 
-local function draw_heart_indicator(x, y, width, alpha)
-    local heartX = x + (width * secondWindPosition)
+local function draw_timing_line(
+    x,
+    y,
+    width,
+    alpha
+)
+    draw_rect(
+        x,
+        y,
+        width,
+        7,
+        25,
+        25,
+        28,
+        alpha
+    )
+
+    draw_target_zone(
+        x,
+        y,
+        width,
+        7,
+        alpha
+    )
+
+    local heartX =
+        x +
+        width *
+        timingPosition
 
     draw_heart(
         heartX,
-        y - 12,
-        0.9,
+        y - 4,
+        1.0,
+        255,
+        255,
+        255,
         alpha
     )
 end
 
-local function draw_hit_markers(x, y, alpha)
-    local spacing = 22
-    local totalWidth = spacing * 2
-    local startX = x - totalWidth / 2
+local function draw_attempts(
+    x,
+    y,
+    alpha
+)
+    for i = 1, MAX_ATTEMPTS do
+        local heartX =
+            x +
+            (
+                i - 1
+            ) *
+            23
 
-    for i = 1, SECOND_WIND_REQUIRED_HITS do
-        local filled = i <= secondWindHits
-        local markerX = startX + ((i - 1) * spacing)
-
-        if filled then
-            draw_rect(
-                markerX,
+        if i <= secondWindAttempts then
+            draw_heart(
+                heartX,
                 y,
-                12,
-                12,
+                0.65,
                 255,
                 255,
                 255,
                 alpha
             )
         else
-            draw_border(
-                markerX,
+            draw_heart_outline(
+                heartX,
                 y,
-                12,
-                12,
-                255,
-                255,
-                255,
-                alpha * 0.55
+                0.65,
+                alpha
             )
         end
     end
 end
 
-local function draw_second_wind_active(alpha)
-    local screenWidth = djui_hud_get_screen_width()
-    local screenHeight = djui_hud_get_screen_height()
+local function draw_hits(
+    y,
+    alpha
+)
+    local spacing = 30
 
-    local panelWidth = math.min(430, screenWidth - 40)
-    local panelHeight = 168
+    local startX =
+        hud_width() / 2 -
+        (
+            (
+                REQUIRED_HITS - 1
+            ) *
+            spacing
+        ) / 2
 
-    local x = (screenWidth - panelWidth) / 2
-    local y = screenHeight * 0.60
+    for i = 1, REQUIRED_HITS do
+        local x =
+            startX +
+            (
+                i - 1
+            ) *
+            spacing
 
-    draw_rect(
-        x + 4,
-        y + 5,
-        panelWidth,
-        panelHeight,
-        0,
-        0,
-        0,
-        alpha * 0.55
-    )
+        if i <= secondWindHits then
+            draw_heart(
+                x,
+                y,
+                0.72,
+                255,
+                255,
+                255,
+                alpha
+            )
+        else
+            draw_heart_outline(
+                x,
+                y,
+                0.72,
+                alpha
+            )
+        end
+    end
+end
 
-    draw_rect(
+local function draw_active_hud()
+    local width =
+        math.min(
+            470,
+            hud_width() - 24
+        )
+
+    local height = 190
+
+    local x =
+        (
+            hud_width() -
+            width
+        ) / 2
+
+    local y =
+        hud_height() * 0.57
+
+    draw_panel(
         x,
         y,
-        panelWidth,
-        panelHeight,
-        0,
-        0,
-        0,
-        alpha * 0.92
+        width,
+        height,
+        hudAlpha
     )
 
-    draw_border(
-        x,
-        y,
-        panelWidth,
-        panelHeight,
-        255,
-        255,
-        255,
-        alpha
-    )
-
-    draw_text_centered(
+    draw_centered_text(
         "SECOND WIND",
         y + 12,
-        0.75,
+        0.72,
         255,
         255,
         255,
-        alpha
+        hudAlpha
     )
 
-    draw_text_centered(
-        "HIT THE CENTER",
-        y + 40,
-        0.40,
-        180,
-        180,
-        180,
-        alpha
+    draw_centered_text(
+        "HIT THE CENTER THREE TIMES",
+        y + 39,
+        0.32,
+        150,
+        150,
+        150,
+        hudAlpha
     )
-
-    local lineWidth = panelWidth - 70
-    local lineX = x + 35
-    local lineY = y + 84
 
     draw_timing_line(
-        lineX,
-        lineY,
-        lineWidth,
-        alpha
+        x + 40,
+        y + 73,
+        width - 80,
+        hudAlpha
     )
 
-    draw_heart_indicator(
-        lineX,
-        lineY,
-        lineWidth,
-        alpha
+    draw_hits(
+        y + 108,
+        hudAlpha
     )
 
-    draw_hit_markers(
-        screenWidth / 2,
-        y + 112,
-        alpha
+    draw_attempts(
+        x + 45,
+        y + 137,
+        hudAlpha
     )
 
-    local attemptText =
-        tostring(secondWindAttempts) ..
-        " ATTEMPTS"
-
-    draw_text_centered(
-        attemptText,
-        y + 136,
-        0.36,
-        160,
-        160,
-        160,
-        alpha
+    draw_text(
+        "A",
+        x + width - 60,
+        y + 132,
+        0.55,
+        255,
+        255,
+        255,
+        hudAlpha
     )
+
+    draw_text(
+        "PRESS",
+        x + width - 82,
+        y + 151,
+        0.25,
+        130,
+        130,
+        130,
+        hudAlpha
+    )
+
+    if hitFlash > 0 then
+        draw_centered_text(
+            "GOOD",
+            y + 164,
+            0.30,
+            255,
+            255,
+            255,
+            hitFlash * 22
+        )
+    elseif missFlash > 0 then
+        draw_centered_text(
+            "MISS",
+            y + 164,
+            0.30,
+            150,
+            150,
+            150,
+            missFlash * 22
+        )
+    end
 end
 
-local function draw_second_wind_success(alpha)
-    local screenWidth = djui_hud_get_screen_width()
-    local screenHeight = djui_hud_get_screen_height()
+local function draw_success_hud()
+    local width =
+        math.min(
+            430,
+            hud_width() - 24
+        )
 
-    local panelWidth = math.min(390, screenWidth - 50)
-    local panelHeight = 118
+    local height = 150
 
-    local x = (screenWidth - panelWidth) / 2
-    local y = screenHeight * 0.64
+    local x =
+        (
+            hud_width() -
+            width
+        ) / 2
 
-    draw_rect(
-        x + 4,
-        y + 5,
-        panelWidth,
-        panelHeight,
-        0,
-        0,
-        0,
-        alpha * 0.55
-    )
+    local y =
+        hud_height() * 0.57
 
-    draw_rect(
+    draw_panel(
         x,
         y,
-        panelWidth,
-        panelHeight,
-        0,
-        0,
-        0,
-        alpha * 0.94
+        width,
+        height,
+        255
     )
 
-    draw_border(
-        x,
-        y,
-        panelWidth,
-        panelHeight,
-        255,
-        255,
-        255,
-        alpha
-    )
-
-    draw_text_centered(
+    draw_centered_text(
         "SECOND WIND",
-        y + 13,
+        y + 14,
         0.72,
         255,
         255,
         255,
-        alpha
+        255
     )
 
-    draw_text_centered(
-        "YOU'RE BACK",
-        y + 48,
-        0.58,
+    draw_heart(
+        hud_width() / 2,
+        y + 59,
+        1.15,
         255,
         255,
         255,
-        alpha
+        255
     )
 
-    draw_hit_markers(
-        screenWidth / 2,
-        y + 82,
-        alpha
+    draw_centered_text(
+        "YOU'RE BACK!",
+        y + 84,
+        0.62,
+        255,
+        255,
+        255
+    )
+
+    draw_centered_text(
+        "GET BACK IN THERE",
+        y + 119,
+        0.32,
+        150,
+        150,
+        150,
+        255
     )
 end
 
-local function draw_second_wind_failed(alpha)
-    local screenWidth = djui_hud_get_screen_width()
-    local screenHeight = djui_hud_get_screen_height()
+local function draw_failure_hud()
+    local width =
+        math.min(
+            430,
+            hud_width() - 24
+        )
 
-    local panelWidth = math.min(390, screenWidth - 50)
-    local panelHeight = 118
+    local height = 150
 
-    local x = (screenWidth - panelWidth) / 2
-    local y = screenHeight * 0.64
+    local x =
+        (
+            hud_width() -
+            width
+        ) / 2
 
-    draw_rect(
-        x + 4,
-        y + 5,
-        panelWidth,
-        panelHeight,
-        0,
-        0,
-        0,
-        alpha * 0.55
-    )
+    local y =
+        hud_height() * 0.57
 
-    draw_rect(
+    draw_panel(
         x,
         y,
-        panelWidth,
-        panelHeight,
-        0,
-        0,
-        0,
-        alpha * 0.94
+        width,
+        height,
+        255
     )
 
-    draw_border(
-        x,
-        y,
-        panelWidth,
-        panelHeight,
-        255,
-        255,
-        255,
-        alpha
-    )
-
-    draw_text_centered(
+    draw_centered_text(
         "SECOND WIND",
-        y + 13,
+        y + 14,
         0.72,
         255,
         255,
         255,
-        alpha
+        255
     )
 
-    draw_text_centered(
-        "MISSED",
-        y + 48,
-        0.58,
-        255,
-        255,
-        255,
-        alpha
+    draw_centered_text(
+        "NOT THIS TIME",
+        y + 54,
+        0.48,
+        180,
+        180,
+        180,
+        255
     )
 
-    draw_text_centered(
-        "NO SECOND CHANCE",
-        y + 78,
-        0.38,
-        170,
-        170,
-        170,
-        alpha
+    draw_centered_text(
+        "BACK TO THE NORMAL DEATH",
+        y + 87,
+        0.30,
+        125,
+        125,
+        125,
+        255
+    )
+
+    draw_centered_text(
+        "GET READY",
+        y + 114,
+        0.28,
+        110,
+        110,
+        110,
+        255
     )
 end
 
 local function render_second_wind()
-    if secondWindState == SECOND_WIND_STATE_IDLE then
+    if secondWindState == STATE_IDLE then
         return
     end
 
-    djui_hud_set_resolution(RESOLUTION_DJUI)
-    djui_hud_set_font(FONT_NORMAL)
+    djui_hud_set_resolution(
+        RESOLUTION_DJUI
+    )
 
-    secondWindPulse =
-        math.max(
-            0,
-            secondWindPulse - 1
-        )
+    djui_hud_set_font(
+        FONT_NORMAL
+    )
 
-    if secondWindState == SECOND_WIND_STATE_ACTIVE then
-        secondWindHudAlpha = clamp(
-            secondWindHudAlpha + 24,
-            0,
-            255
-        )
-
-        draw_second_wind_active(
-            secondWindHudAlpha
-        )
-
+    if secondWindState == STATE_ACTIVE then
+        draw_active_hud()
         return
     end
 
-    if secondWindState == SECOND_WIND_STATE_SUCCESS then
-        draw_second_wind_success(255)
+    if secondWindState == STATE_SUCCESS then
+        draw_success_hud()
         return
     end
 
-    if secondWindState == SECOND_WIND_STATE_FAILED then
-        draw_second_wind_failed(255)
+    if secondWindState == STATE_FAILED then
+        draw_failure_hud()
     end
 end
 
-local function on_test_button()
+local function set_enabled(
+    index,
+    value
+)
     if not network_is_server() then
-        djui_chat_message_create(
-            "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Only the host can start the test."
-        )
-
         return
     end
 
-    secondWindTestRequested = true
-
-    djui_chat_message_create(
-        "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Test enabled. Take damage or use /secondwind test."
-    )
-end
-
-local function on_reset_button()
-    reset_second_wind()
-
-    secondWindCooldown = 0
-    gPlayerSyncTable[0].secondWindAvailable = true
-    gPlayerSyncTable[0].secondWindRecovered = false
-
-    djui_chat_message_create(
-        "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Charge reset."
-    )
-end
-
-local function on_enabled_changed(index, value)
-    secondWindMenuEnabled = value
-
-    if network_is_server() then
-        gGlobalSyncTable.secondWindEnabled = value
-    end
+    secondWindEnabled = value
+    gGlobalSyncTable.secondWindEnabled = value
 
     if not value then
-        reset_second_wind()
+        reset_minigame()
+        reset_saved_position()
     end
 end
 
-local function on_difficulty_changed(index, value)
-    secondWindMenuDifficulty = value
-
-    if network_is_server() then
-        gGlobalSyncTable.secondWindDifficulty = value
+local function set_difficulty(
+    index,
+    value
+)
+    if not network_is_server() then
+        return
     end
+
+    secondWindDifficulty =
+        clamp(
+            value,
+            DIFFICULTY_NORMAL,
+            DIFFICULTY_EXPERT
+        )
+
+    gGlobalSyncTable.secondWindDifficulty =
+        secondWindDifficulty
 end
 
-local function on_chat_command(msg)
-    msg = string.lower(msg or "")
+local function reset_second_wind(
+    index
+)
+    if index ~= 0 then
+        return
+    end
 
-    if msg == "test" then
-        if not network_is_server() then
-            djui_chat_message_create(
-                "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Only the host can start the test."
-            )
+    if not network_is_server() then
+        djui_chat_message_create(
+            "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Only the host can reset it."
+        )
 
-            return true
-        end
+        return
+    end
 
-        local m = gMarioStates[0]
+    reset_minigame()
+    reset_saved_position()
 
-        if m ~= nil then
-            secondWindSavedPosition = copy_position(m)
-            secondWindSavedAngle = m.faceAngle.y
-            secondWindTestRequested = false
+    cooldownTimer = 0
 
-            gPlayerSyncTable[0].secondWindAvailable = true
+    reset_player_sync()
 
-            start_second_wind(m)
+    djui_chat_message_create(
+        "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Reset."
+    )
+end
 
-            djui_chat_message_create(
-                "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Timing test started."
-            )
-        end
+local function second_wind_command(msg)
+    msg =
+        string.lower(
+            msg or ""
+        )
 
+    if msg == "reset" then
+        reset_second_wind(0)
         return true
     end
 
-    if msg == "reset" then
-        reset_second_wind()
+    if msg == "status" then
+        local status = "READY"
 
-        secondWindCooldown = 0
-        gPlayerSyncTable[0].secondWindAvailable = true
-        gPlayerSyncTable[0].secondWindRecovered = false
+        if secondWindState == STATE_ACTIVE then
+            status = "ACTIVE"
+        elseif secondWindState == STATE_SUCCESS then
+            status = "SUCCESS"
+        elseif secondWindState == STATE_FAILED then
+            status = "FAILED"
+        end
 
         djui_chat_message_create(
-            "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Charge reset."
+            "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ Status: " ..
+            status
         )
 
         return true
     end
 
     djui_chat_message_create(
-        "\\#FFFFFF\\Second Wind commands\\#AAAAAA\\"
+        "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ /secondwind reset"
     )
 
     djui_chat_message_create(
-        "/secondwind test"
-    )
-
-    djui_chat_message_create(
-        "/secondwind reset"
+        "\\#FFFFFF\\[Second Wind]\\#AAAAAA\\ /secondwind status"
     )
 
     return true
 end
 
-local function update_test_request()
-    if not secondWindTestRequested then
-        return
-    end
-
-    if secondWindState ~= SECOND_WIND_STATE_IDLE then
-        return
-    end
-
-    local m = gMarioStates[0]
-
-    if m == nil then
-        return
-    end
-
-    secondWindTestRequested = false
-
-    gPlayerSyncTable[0].secondWindAvailable = true
-
-    start_second_wind(m)
-end
-
 local function initialize_second_wind()
-    gGlobalSyncTable.secondWindEnabled = true
-    gGlobalSyncTable.secondWindDifficulty = 1
+    secondWindEnabled = true
+    secondWindDifficulty = DIFFICULTY_NORMAL
 
-    gPlayerSyncTable[0].secondWindAvailable = true
-    gPlayerSyncTable[0].secondWindRecovered = false
+    if network_is_server() then
+        gGlobalSyncTable.secondWindEnabled = true
+        gGlobalSyncTable.secondWindDifficulty =
+            DIFFICULTY_NORMAL
+    end
 
-    reset_second_wind()
+    reset_minigame()
+    reset_saved_position()
+
+    cooldownTimer = 0
+
+    reset_player_sync()
 end
 
 hook_event(
     HOOK_MARIO_UPDATE,
     mario_update
+)
+
+hook_event(
+    HOOK_BEFORE_MARIO_UPDATE,
+    before_mario_update
+)
+
+hook_event(
+    HOOK_BEFORE_SET_MARIO_ACTION,
+    before_set_mario_action
+)
+
+hook_event(
+    HOOK_ON_SET_CAMERA_MODE,
+    on_camera_mode
+)
+
+hook_event(
+    HOOK_ON_CHANGE_CAMERA_ANGLE,
+    on_change_camera_angle
 )
 
 hook_event(
@@ -979,7 +1494,7 @@ hook_event(
 
 hook_event(
     HOOK_UPDATE,
-    update_test_request
+    update_second_wind
 )
 
 hook_event(
@@ -989,32 +1504,35 @@ hook_event(
 
 hook_chat_command(
     "secondwind",
-    "[test|reset]",
-    on_chat_command
+    "[reset|status]",
+    second_wind_command
+)
+
+hook_mod_menu_text(
+    "Second Wind"
 )
 
 hook_mod_menu_checkbox(
     "Enabled",
     true,
-    on_enabled_changed
+    set_enabled
+)
+
+hook_mod_menu_text(
+    "Modifiers"
 )
 
 hook_mod_menu_slider(
     "Difficulty",
-    1,
-    1,
-    3,
-    on_difficulty_changed
-)
-
-hook_mod_menu_button(
-    "Test Timing Challenge",
-    on_test_button
+    DIFFICULTY_NORMAL,
+    DIFFICULTY_NORMAL,
+    DIFFICULTY_EXPERT,
+    set_difficulty
 )
 
 hook_mod_menu_button(
     "Reset Second Wind",
-    on_reset_button
+    reset_second_wind
 )
 
 initialize_second_wind()
